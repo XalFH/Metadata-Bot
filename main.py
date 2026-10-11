@@ -18,10 +18,10 @@ from telegraph import Telegraph
 # ============================================================
 # CONFIGURATION — put your values here (no .env required)
 # ============================================================
-API_ID = 123456                 # Integer from https://my.telegram.org
-API_HASH = "PASTE_API_HASH_HERE"
-BOT_TOKEN = "PASTE_BOT_TOKEN_HERE"
-TELEGRAPH_ACCESS_TOKEN = "PASTE_TELEGRAPH_TOKEN_HERE"  # Optional; "" auto-creates account
+API_ID = 32541562                 # Integer from https://my.telegram.org
+API_HASH = "e37e4432298d5a5eb4a6e32c18804283"
+BOT_TOKEN = "8958744545:AAFIWwJh5nrVMOnoyKEUqdysNktP0g2eS8k"
+TELEGRAPH_ACCESS_TOKEN = "6288219713e387a679586a9a184b6be21b795770e11f60d6006bd0005342"  # Optional; "" auto-creates account
 
 BOT_NAME = "MediaInfo Bot"
 AUTHOR_NAME = "ASVM"
