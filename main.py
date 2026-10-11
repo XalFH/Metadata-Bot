@@ -1,361 +1,545 @@
-"""
-Advanced Telegraph MediaInfo Bot
-Fill in the four settings below, then run: python main.py
-"""
-
 import asyncio
 import html
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.types import Message
 from pymediainfo import MediaInfo
-from telegraph import Telegraph
+from pymongo import MongoClient, ASCENDING
 
-# ============================================================
-# CONFIGURATION — put your values here (no .env required)
-# ============================================================
-API_ID = 32541562                 # Integer from https://my.telegram.org
-API_HASH = "e37e4432298d5a5eb4a6e32c18804283"
-BOT_TOKEN = "8958744545:AAFIWwJh5nrVMOnoyKEUqdysNktP0g2eS8k"
-TELEGRAPH_ACCESS_TOKEN = "6288219713e387a679586a9a184b6be21b795770e11f60d6006bd0005342"  # Optional; "" auto-creates account
+# =========================================================
+# CONFIGURATION — KEEP YOUR EXISTING API CREDENTIALS
+# =========================================================
+
+API_ID = 123456  # Keep your existing API_ID
+API_HASH = "YOUR_EXISTING_API_HASH"
+BOT_TOKEN = "YOUR_EXISTING_BOT_TOKEN"
+
+# Paste your existing MongoDB connection URI here.
+MONGODB_URI = "YOUR_EXISTING_MONGODB_URI"
 
 BOT_NAME = "MediaInfo Bot"
-AUTHOR_NAME = "ASVM"
-MAX_FILE_SIZE_GB = 4            # Requested limit: 4 GB
-MAX_CONCURRENT_JOBS = 1         # Keep low for large files / limited hosting
-DOWNLOAD_TIMEOUT_SECONDS = 60 * 60
-ANALYSIS_TIMEOUT_SECONDS = 15 * 60
-TELEGRAPH_TIMEOUT_SECONDS = 90
-# ============================================================
+MAX_FILE_SIZE_GB = 4
+MAX_CONCURRENT_JOBS = 1
 
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_GB * 1024 * 1024 * 1024
+DOWNLOAD_TIMEOUT = 3600
+ANALYSIS_TIMEOUT = 900
+
+DATABASE_NAME = "mediainfo_bot"
+COLLECTION_NAME = "video_headers"
+
+# =========================================================
+
+MAX_FILE_SIZE = MAX_FILE_SIZE_GB * 1024**3
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logger = logging.getLogger("telegraph_mediainfo_bot")
 
-if not isinstance(API_ID, int) or API_ID <= 0:
-    raise RuntimeError("Set API_ID in the CONFIGURATION section of main.py.")
-if not API_HASH or API_HASH == "PASTE_API_HASH_HERE":
-    raise RuntimeError("Set API_HASH in the CONFIGURATION section of main.py.")
-if not BOT_TOKEN or BOT_TOKEN == "PASTE_BOT_TOKEN_HERE":
-    raise RuntimeError("Set BOT_TOKEN in the CONFIGURATION section of main.py.")
+logger = logging.getLogger("MediaInfoBot")
 
 app = Client(
-    "telegraph_mediainfo_bot",
+    "mediainfo_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    sleep_threshold=60,
 )
-job_semaphore = asyncio.Semaphore(max(1, MAX_CONCURRENT_JOBS))
-telegraph = Telegraph(access_token=TELEGRAPH_ACCESS_TOKEN) if TELEGRAPH_ACCESS_TOKEN else Telegraph()
 
+mongo_client = MongoClient(
+    MONGODB_URI,
+    serverSelectionTimeoutMS=10000,
+    connectTimeoutMS=10000,
+)
 
-def clean(value, fallback="Unknown"):
-    if value is None:
-        return fallback
-    value = str(value).strip()
-    return value if value else fallback
+database = mongo_client[DATABASE_NAME]
+collection = database[COLLECTION_NAME]
 
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
-def track_language(track):
-    for attr in ("other_language", "other_language_ietf"):
-        value = getattr(track, attr, None)
-        if value:
-            if isinstance(value, (list, tuple)):
-                value = value[0] if value else None
-            if value:
-                return str(value).strip()
-    return clean(getattr(track, "language", None), "Undetermined")
+VIDEO_EXTENSIONS = {
+    ".mkv", ".mp4", ".mov", ".avi", ".webm",
+    ".m4v", ".mpeg", ".mpg", ".ts", ".mts",
+    ".wmv", ".3gp", ".m2ts", ".vob", ".flv",
+}
 
 
 def human_size(size):
     size = float(size or 0)
+
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if size < 1024 or unit == "TB":
             return f"{size:.2f} {unit}"
+
         size /= 1024
+
     return f"{size:.2f} TB"
 
 
 def human_duration(milliseconds):
     try:
         seconds = max(0, int(float(milliseconds) / 1000))
-        hours, rem = divmod(seconds, 3600)
-        minutes, seconds = divmod(rem, 60)
-        return f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
+        hours, remaining = divmod(seconds, 3600)
+        minutes, seconds = divmod(remaining, 60)
+
+        if hours:
+            return f"{hours}h {minutes}m {seconds}s"
+
+        return f"{minutes}m {seconds}s"
+
     except (TypeError, ValueError):
         return "Unknown"
 
 
-def get_value(track, *names, fallback="Unknown"):
-    for name in names:
-        value = getattr(track, name, None)
+def get_value(track, *fields, default="Unknown"):
+    for field in fields:
+        value = getattr(track, field, None)
+
         if value not in (None, ""):
             return str(value)
-    return fallback
+
+    return default
 
 
-def build_html_page(file_name, file_size, media_info):
-    general = next((t for t in media_info.tracks if (getattr(t, "track_type", "") or "").lower() == "general"), None)
-    video_tracks, audio_tracks, subtitle_tracks, other_tracks = [], [], [], []
+def get_language(track):
+    for field in ("other_language", "other_language_ietf"):
+        value = getattr(track, field, None)
 
-    for track in media_info.tracks:
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+
+        if value:
+            return str(value)
+
+    return get_value(track, "language", default="Undetermined")
+
+
+def get_track_data(track):
+    """Convert MediaInfo track details into MongoDB-safe data."""
+
+    fields = (
+        "track_type",
+        "format",
+        "format_profile",
+        "codec_id",
+        "codec_id_info",
+        "width",
+        "height",
+        "display_aspect_ratio",
+        "frame_rate",
+        "bit_rate",
+        "bit_rate_mode",
+        "duration",
+        "language",
+        "other_language",
+        "other_language_ietf",
+        "title",
+        "channel_s",
+        "sampling_rate",
+        "bit_depth",
+        "hdr_format",
+        "stream_size",
+        "default",
+        "forced",
+        "encoded_library",
+        "encoded_application",
+        "overall_bit_rate",
+        "file_size",
+    )
+
+    data = {}
+
+    for field in fields:
+        value = getattr(track, field, None)
+
+        if value is None:
+            continue
+
+        if isinstance(value, (str, int, float, bool, list, dict)):
+            data[field] = value
+
+        elif isinstance(value, tuple):
+            data[field] = list(value)
+
+        else:
+            data[field] = str(value)
+
+    return data
+
+
+def create_report(file_name, file_size, media_info):
+    tracks = media_info.tracks
+
+    general = next(
+        (
+            track for track in tracks
+            if (getattr(track, "track_type", "") or "").lower() == "general"
+        ),
+        None,
+    )
+
+    videos = []
+    audios = []
+    subtitles = []
+    other_tracks = []
+
+    for track in tracks:
         kind = (getattr(track, "track_type", "") or "").lower()
+
         if kind == "general":
             continue
 
         if kind == "video":
-            width = get_value(track, "width", fallback="?")
-            height = get_value(track, "height", fallback="?")
-            codec = get_value(track, "format", "codec_id")
-            fps = get_value(track, "frame_rate", fallback="")
-            bitrate = get_value(track, "bit_rate", fallback="")
-            hdr = get_value(track, "hdr_format", fallback="")
-            details = [f"{codec} · {width}×{height}"]
-            if fps:
-                details.append(f"{fps} FPS")
-            if bitrate:
-                details.append(f"{bitrate} bit/s")
-            if hdr:
-                details.append(hdr)
-            video_tracks.append(" · ".join(details))
+            videos.append({
+                "codec": get_value(track, "format", "codec_id"),
+                "width": get_value(track, "width"),
+                "height": get_value(track, "height"),
+                "fps": get_value(track, "frame_rate"),
+                "bitrate": get_value(track, "bit_rate"),
+                "hdr": get_value(track, "hdr_format", default=""),
+                "language": get_language(track),
+            })
 
         elif kind == "audio":
-            lang = track_language(track)
-            title = get_value(track, "title", fallback="")
-            codec = get_value(track, "format", "codec_id", fallback="")
-            channels = get_value(track, "channel_s", fallback="")
-            sample_rate = get_value(track, "sampling_rate", fallback="")
-            bitrate = get_value(track, "bit_rate", fallback="")
-            label = lang if lang not in ("Undetermined", "Unknown", "und") else (title or "Undetermined")
-            details = [x for x in (codec, channels, f"{sample_rate} Hz" if sample_rate else "", f"{bitrate} bit/s" if bitrate else "") if x]
-            audio_tracks.append((label, " · ".join(details)))
+            audios.append({
+                "language": get_language(track),
+                "title": get_value(track, "title", default=""),
+                "codec": get_value(track, "format", "codec_id"),
+                "channels": get_value(track, "channel_s"),
+                "sample_rate": get_value(track, "sampling_rate"),
+                "bitrate": get_value(track, "bit_rate"),
+            })
 
         elif kind in ("text", "subtitle"):
-            lang = track_language(track)
-            title = get_value(track, "title", fallback="")
-            codec = get_value(track, "format", "codec_id", fallback="")
-            label = lang if lang not in ("Undetermined", "Unknown", "und") else (title or "Undetermined")
-            subtitle_tracks.append((label, codec))
+            subtitles.append({
+                "language": get_language(track),
+                "title": get_value(track, "title", default=""),
+                "codec": get_value(track, "format", "codec_id"),
+                "default": get_value(track, "default"),
+                "forced": get_value(track, "forced"),
+            })
 
         else:
-            other_tracks.append((kind or "Other", get_value(track, "format", "codec_id")))
+            other_tracks.append(get_track_data(track))
 
-    parts = [
-        "<h2>Media Track Information</h2>",
-        "<p><b>File:</b> " + html.escape(file_name) + "</p>",
-        "<p><b>File size:</b> " + html.escape(human_size(file_size)) + "</p>",
+    report = [
+        "<b>🎬 MEDIAINFO REPORT</b>",
+        "",
+        f"<b>📁 File:</b> <code>{html.escape(file_name)}</code>",
+        f"<b>💾 Size:</b> {human_size(file_size)}",
     ]
 
     if general:
-        info = []
-        for label, names in (
-            ("Container", ("format",)),
-            ("Duration", ("duration",)),
-            ("Overall bitrate", ("overall_bit_rate",)),
-            ("Encoded application", ("encoded_application",)),
-            ("Encoded library", ("encoded_library",)),
-        ):
-            value = None
-            for name in names:
-                value = getattr(general, name, None)
-                if value not in (None, ""):
-                    break
-            if value not in (None, ""):
-                if label == "Duration":
-                    value = human_duration(value)
-                elif label == "Overall bitrate":
-                    value = f"{value} bit/s"
-                info.append(f"<b>{html.escape(label)}:</b> {html.escape(str(value))}")
-        if info:
-            parts.extend(["<h3>General Information</h3>", "<p>" + "<br>".join(info) + "</p>"])
+        container = get_value(general, "format")
+        duration = get_value(general, "duration")
+        bitrate = get_value(general, "overall_bit_rate")
 
-    def add_section(title, entries, empty_text):
-        parts.append(f"<h3>{html.escape(title)} ({len(entries)})</h3>")
-        if not entries:
-            parts.append(f"<p>{html.escape(empty_text)}</p>")
-            return
-        for item in entries:
-            if isinstance(item, tuple):
-                name, details = item
-                line = html.escape(str(name))
-                if details:
-                    line += " — " + html.escape(str(details))
-            else:
-                line = html.escape(str(item))
-            parts.append("<blockquote>" + line + "</blockquote>")
+        report.extend([
+            f"<b>📦 Container:</b> {html.escape(container)}",
+            f"<b>⏱ Duration:</b> {human_duration(duration) if duration != 'Unknown' else 'Unknown'}",
+            f"<b>📊 Overall bitrate:</b> {html.escape(bitrate)} bit/s",
+        ])
 
-    add_section("Video Tracks", video_tracks, "No video tracks detected.")
-    add_section("Audio Tracks", audio_tracks, "No audio tracks detected.")
-    add_section("Subtitle Tracks", subtitle_tracks, "No subtitle tracks detected.")
-    if other_tracks:
-        add_section("Other Streams", other_tracks, "No other streams detected.")
+    report.extend(["", f"<b>🎥 VIDEO TRACKS ({len(videos)})</b>"])
 
-    if len(audio_tracks) > 1:
-        note = "This file contains multiple audio tracks. Use VLC Media Player to switch audio tracks."
-    elif len(audio_tracks) == 1:
-        note = "This file contains one detected audio track."
+    if videos:
+        for index, video in enumerate(videos, 1):
+            report.extend([
+                "",
+                f"<b>Video #{index}</b>",
+                f"• Codec: {html.escape(video['codec'])}",
+                f"• Resolution: {html.escape(video['width'])} × {html.escape(video['height'])}",
+                f"• FPS: {html.escape(video['fps'])}",
+                f"• Bitrate: {html.escape(video['bitrate'])}",
+            ])
+
+            if video["hdr"] and video["hdr"] != "Unknown":
+                report.append(f"• HDR: {html.escape(video['hdr'])}")
     else:
-        note = "No audio track was detected. If playback fails, try VLC Media Player."
-    parts.append("<h3>Note</h3><p>" + html.escape(note) + "</p>")
-    parts.append(f"<hr><p><b>{html.escape(AUTHOR_NAME)}</b><br>{html.escape(BOT_NAME)}</p>")
-    return "".join(parts)
+        report.append("No video tracks detected.")
+
+    report.extend(["", f"<b>🔊 AUDIO TRACKS ({len(audios)})</b>"])
+
+    if audios:
+        for index, audio in enumerate(audios, 1):
+            report.extend([
+                "",
+                f"<b>Audio #{index}</b>",
+                f"• Language: {html.escape(audio['language'])}",
+                f"• Title: {html.escape(audio['title'])}",
+                f"• Codec: {html.escape(audio['codec'])}",
+                f"• Channels: {html.escape(audio['channels'])}",
+                f"• Sample rate: {html.escape(audio['sample_rate'])} Hz",
+                f"• Bitrate: {html.escape(audio['bitrate'])}",
+            ])
+    else:
+        report.append("No audio tracks detected.")
+
+    report.extend(["", f"<b>💬 SUBTITLE TRACKS ({len(subtitles)})</b>"])
+
+    if subtitles:
+        for index, subtitle in enumerate(subtitles, 1):
+            report.extend([
+                "",
+                f"<b>Subtitle #{index}</b>",
+                f"• Language: {html.escape(subtitle['language'])}",
+                f"• Title: {html.escape(subtitle['title'])}",
+                f"• Format: {html.escape(subtitle['codec'])}",
+                f"• Default: {html.escape(subtitle['default'])}",
+                f"• Forced: {html.escape(subtitle['forced'])}",
+            ])
+    else:
+        report.append("No subtitle tracks detected.")
+
+    if other_tracks:
+        report.extend([
+            "",
+            f"<b>📚 OTHER TRACKS ({len(other_tracks)})</b>",
+        ])
+
+        for track in other_tracks:
+            report.append(
+                "• " + html.escape(
+                    f"{track.get('track_type', 'Other')}: "
+                    f"{track.get('format', 'Unknown')}"
+                )
+            )
+
+    report.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        f"<b>{html.escape(BOT_NAME)}</b>",
+    ])
+
+    return "\n".join(report), {
+        "general": get_track_data(general) if general else {},
+        "video_tracks": videos,
+        "audio_tracks": audios,
+        "subtitle_tracks": subtitles,
+        "other_tracks": other_tracks,
+        "raw_tracks": [get_track_data(track) for track in tracks],
+    }
 
 
-def initialize_telegraph():
-    global telegraph
-    if TELEGRAPH_ACCESS_TOKEN and TELEGRAPH_ACCESS_TOKEN != "PASTE_TELEGRAPH_TOKEN_HERE":
-        telegraph = Telegraph(access_token=TELEGRAPH_ACCESS_TOKEN)
+async def save_to_mongodb(document):
+    """Use a worker thread so database operations don't block the bot."""
+
+    def save():
+        collection.update_one(
+            {
+                "chat_id": document["chat_id"],
+                "message_id": document["message_id"],
+            },
+            {"$set": document},
+            upsert=True,
+        )
+
+    await asyncio.to_thread(save)
+
+
+async def send_long_message(message, text):
+    """Split large reports into Telegram-sized messages."""
+
+    max_length = 3800
+
+    if len(text) <= max_length:
+        await message.reply_text(text, disable_web_page_preview=True)
         return
-    account = telegraph.create_account(short_name="MediaInfoBot")
-    token = account.get("access_token")
-    if not token:
-        raise RuntimeError("Telegraph account creation failed. Add TELEGRAPH_ACCESS_TOKEN in main.py.")
-    telegraph = Telegraph(access_token=token)
-    logger.warning("Telegraph account was created automatically; its token may not persist after a restart.")
+
+    chunks = []
+    current = ""
+
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > max_length:
+            if current:
+                chunks.append(current)
+
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await message.reply_text(
+            chunk,
+            disable_web_page_preview=True,
+        )
 
 
-async def analyze_video(message: Message):
+async def process_video(message: Message):
     media = message.video or message.document
+
     if not media:
-        await message.reply_text("Send a video file as a video or document.")
         return
 
     file_name = getattr(media, "file_name", None) or "video.mkv"
     mime_type = getattr(media, "mime_type", "") or ""
-    extensions = {
-        ".mkv", ".mp4", ".mov", ".avi", ".webm", ".m4v", ".mpeg",
-        ".mpg", ".ts", ".mts", ".wmv", ".3gp", ".m2ts", ".vob", ".flv",
-    }
-    if message.document and not mime_type.startswith("video/") and Path(file_name).suffix.lower() not in extensions:
-        await message.reply_text("This doesn't look like a supported video file.")
-        return
+    extension = Path(file_name).suffix.lower()
 
-    size = int(getattr(media, "file_size", 0) or 0)
-    if size > MAX_FILE_SIZE_BYTES:
+    if message.document:
+        if not mime_type.startswith("video/") and extension not in VIDEO_EXTENSIONS:
+            return
+
+    file_size = int(getattr(media, "file_size", 0) or 0)
+
+    if file_size > MAX_FILE_SIZE:
         await message.reply_text(
-            f"File is too large. Configured limit: {MAX_FILE_SIZE_GB} GB "
-            f"({human_size(MAX_FILE_SIZE_BYTES)})."
+            f"❌ File exceeds the configured {MAX_FILE_SIZE_GB} GB limit.\n"
+            f"Received: {human_size(file_size)}"
         )
         return
 
-    async with job_semaphore:
-        status = await message.reply_text("Downloading video for MediaInfo analysis...")
+    async with semaphore:
+        status = await message.reply_text("⏳ Processing video and extracting MediaInfo...")
+
         temp_path = None
+
         try:
             suffix = Path(file_name).suffix or ".mkv"
-            fd, temp_path = tempfile.mkstemp(prefix="mediainfo_", suffix=suffix)
+
+            fd, temp_path = tempfile.mkstemp(
+                prefix="mediainfo_",
+                suffix=suffix,
+            )
             os.close(fd)
 
-            # Pyrogram streams the download to disk; no full video is loaded into RAM.
-            download_task = asyncio.create_task(message.download(file_name=temp_path))
-            try:
-                downloaded = await asyncio.wait_for(download_task, timeout=DOWNLOAD_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                download_task.cancel()
-                await status.edit_text("Download timed out. Try again or use a host with more bandwidth.")
-                return
+            downloaded = await asyncio.wait_for(
+                message.download(file_name=temp_path),
+                timeout=DOWNLOAD_TIMEOUT,
+            )
 
             if not downloaded or not os.path.isfile(downloaded):
-                await status.edit_text("Video download failed.")
+                await status.edit_text("❌ Video download failed.")
                 return
+
             temp_path = downloaded
             actual_size = os.path.getsize(temp_path)
-            if actual_size <= 0:
-                await status.edit_text("The downloaded file is empty.")
-                return
-            if actual_size > MAX_FILE_SIZE_BYTES:
-                await status.edit_text("The downloaded file exceeded the configured 4 GB limit.")
+
+            if actual_size > MAX_FILE_SIZE:
+                await status.edit_text("❌ Downloaded file exceeds the configured size limit.")
                 return
 
-            await status.edit_text("Analyzing container, video, audio and subtitle tracks...")
-            try:
-                media_info = await asyncio.wait_for(
-                    asyncio.to_thread(MediaInfo.parse, temp_path, full=False),
-                    timeout=ANALYSIS_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                await status.edit_text("MediaInfo analysis timed out. The file may be damaged or unusually complex.")
-                return
+            media_info = await asyncio.wait_for(
+                asyncio.to_thread(MediaInfo.parse, temp_path),
+                timeout=ANALYSIS_TIMEOUT,
+            )
 
             if not media_info or not media_info.tracks:
-                await status.edit_text("MediaInfo couldn't read tracks from this file.")
+                await status.edit_text("❌ Could not read MediaInfo from this video.")
                 return
 
-            await status.edit_text("Publishing report to Telegraph...")
-            page_html = build_html_page(file_name, actual_size, media_info)
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    telegraph.create_page,
-                    title=("MediaInfo - " + file_name)[:200],
-                    html_content=page_html,
-                    author_name=AUTHOR_NAME,
-                    author_url=None,
-                ),
-                timeout=TELEGRAPH_TIMEOUT_SECONDS,
+            report, tracks_data = create_report(
+                file_name,
+                actual_size,
+                media_info,
             )
-            url = response.get("url")
-            if not url:
-                await status.edit_text("Telegraph didn't return a report URL.")
-                return
 
+            # Save video header and extracted track information in MongoDB.
+            document = {
+                "chat_id": message.chat.id,
+                "message_id": message.id,
+                "user_id": message.from_user.id if message.from_user else None,
+                "file_name": file_name,
+                "file_id": media.file_id,
+                "file_unique_id": media.file_unique_id,
+                "file_size": actual_size,
+                "file_size_human": human_size(actual_size),
+                "mime_type": mime_type,
+                "created_at": datetime.now(timezone.utc),
+                "media_info": tracks_data,
+            }
+
+            await save_to_mongodb(document)
+
+            await status.delete()
+
+            await send_long_message(message, report)
+
+            logger.info(
+                "Processed %s (%s) and saved metadata to MongoDB",
+                file_name,
+                human_size(actual_size),
+            )
+
+        except asyncio.TimeoutError:
             await status.edit_text(
-                "<b>MediaInfo report created.</b>\n\n"
-                f"<b>File:</b> <code>{html.escape(file_name)}</code>\n"
-                f"<b>Size:</b> {human_size(actual_size)}\n\n"
-                "Open the report to view video, audio and subtitle tracks.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("View MediaInfo Report", url=url)]]
-                ),
+                "❌ Processing timed out. Try again with another video."
             )
-        except Exception as exc:
+
+        except Exception:
             logger.exception("Video processing failed")
+
             try:
-                message_text = html.escape(str(exc))[:700]
-                await status.edit_text(f"Could not process this video.\n<code>{message_text}</code>")
+                await status.edit_text(
+                    "❌ Something went wrong while processing the video. "
+                    "Check the deployment logs."
+                )
             except Exception:
                 pass
+
         finally:
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except OSError:
-                    logger.warning("Could not remove temporary file: %s", temp_path)
+                    logger.warning("Could not remove temporary file.")
 
 
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
-        f"<b>Welcome to {html.escape(BOT_NAME)}.</b>\n\n"
-        "Send a video file and I'll inspect its container, video, audio and subtitle tracks "
-        "and publish a Telegraph report.\n\n"
-        "You can also reply to a video with <code>/mediainfo</code>.\n"
-        f"Configured file-size limit: <b>{MAX_FILE_SIZE_GB} GB</b>."
+        "<b>🎬 MediaInfo Bot</b>\n\n"
+        "Send me a video to extract its MediaInfo instantly.\n\n"
+        "I can show:\n"
+        "• Video codec, resolution, FPS and bitrate\n"
+        "• Audio languages, codecs and channels\n"
+        "• Subtitle tracks\n"
+        "• Container and duration\n\n"
+        "Video metadata is stored in MongoDB."
     )
-
-
-@app.on_message(filters.command(["mediainfo", "mi"]) & filters.reply)
-async def mediainfo_reply_handler(client: Client, message: Message):
-    replied = message.reply_to_message
-    if not replied or not (replied.video or replied.document):
-        await message.reply_text("Reply to a video file with /mediainfo.")
-        return
-    await analyze_video(replied)
 
 
 @app.on_message(filters.video | filters.document)
 async def video_handler(client: Client, message: Message):
-    await analyze_video(message)
+    await process_video(message)
+
+
+@app.on_message(filters.command(["mediainfo", "mi"]) & filters.reply)
+async def reply_handler(client: Client, message: Message):
+    replied = message.reply_to_message
+
+    if replied and (replied.video or replied.document):
+        await process_video(replied)
+    else:
+        await message.reply_text("Reply to a video with /mediainfo.")
+
+
+async def check_mongodb():
+    await asyncio.to_thread(mongo_client.admin.command, "ping")
+    await asyncio.to_thread(
+        collection.create_index,
+        [("chat_id", ASCENDING), ("message_id", ASCENDING)],
+        unique=True,
+    )
 
 
 if __name__ == "__main__":
-    initialize_telegraph()
-    logger.info("Starting %s; configured max file size: %s GB", BOT_NAME, MAX_FILE_SIZE_GB)
+    if not MONGODB_URI or MONGODB_URI == "YOUR_EXISTING_MONGODB_URI":
+        raise RuntimeError("Configure MONGODB_URI in main.py.")
+
+    check_loop = asyncio.new_event_loop()
+
+    try:
+        check_loop.run_until_complete(check_mongodb())
+        logger.info("MongoDB connection successful.")
+    finally:
+        check_loop.close()
+
+    logger.info("Starting %s...", BOT_NAME)
     app.run()
