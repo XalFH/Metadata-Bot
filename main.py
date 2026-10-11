@@ -15,12 +15,12 @@ from pymongo import MongoClient, ASCENDING
 # CONFIGURATION — KEEP YOUR EXISTING API CREDENTIALS
 # =========================================================
 
-API_ID = 123456  # Keep your existing API_ID
-API_HASH = "YOUR_EXISTING_API_HASH"
-BOT_TOKEN = "YOUR_EXISTING_BOT_TOKEN"
+API_ID = 32541562  # Keep your existing API_ID
+API_HASH = "e37e4432298d5a5eb4a6e32c18804283"
+BOT_TOKEN = "8958744545:AAFIWwJh5nrVMOnoyKEUqdysNktP0g2eS8k"
 
 # Paste your existing MongoDB connection URI here.
-MONGODB_URI = "YOUR_EXISTING_MONGODB_URI"
+MONGODB_URI = "mongodb+srv://asvm:incorrectasvm@cluster0.v2z8vnw.mongodb.net/?appName=Cluster0"
 
 BOT_NAME = "MediaInfo Bot"
 MAX_FILE_SIZE_GB = 4
